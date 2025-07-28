@@ -31,11 +31,22 @@ from tqdm import tqdm
 from abc import ABC, abstractmethod
 import csv
 import importlib
+import concurrent.futures
+import threading
+from functools import partial
+
+from my_models.ii_medical_inference import extract_solution
 
 # Set up logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
+
+# Suppress HTTP request logs from OpenAI client and related libraries
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("requests").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
@@ -183,7 +194,12 @@ class LocalModel(BaseModel):
 class CustomModel(BaseModel):
     """Custom model wrapper for user-defined models"""
 
-    def __init__(self, model_name: str, model_instance, inference_func):
+    def __init__(
+        self,
+        model_name: str,
+        model_instance: Any,
+        inference_func: Callable,
+    ):
         super().__init__(model_name)
         self.model = model_instance
         self._inference_func = inference_func
@@ -191,11 +207,8 @@ class CustomModel(BaseModel):
     def load(self, **kwargs):
         """Custom models are already loaded"""
         logger.info(f"Using custom model: {self.model_name}")
-        import pdb
 
-        pdb.set_trace()
-
-    def inference(self, prompt: str, max_tokens: int = 1024) -> Tuple[str, List[Dict]]:
+    def inference(self, prompt: str, max_tokens: int = 4096) -> Tuple[str, List[Dict]]:
         """Custom model inference"""
         try:
             # For custom models, we'll create a simple message structure
@@ -406,67 +419,18 @@ class CompetitionKit:
         # Store dataset examples for later use in save_submission
         self._last_dataset_examples = dataset
 
-        # Run evaluation
-        predictions = []
-        reasoning_traces = []  # Store reasoning traces
+        # Run evaluation with parallel processing
         total_count = len(dataset)
-        # Track accuracy only for non-open-ended questions
-        accuracy_correct_count = 0
-        accuracy_total_count = 0
-
         logger.info(f"Running evaluation on {total_count} examples...")
-        for i, example in enumerate(tqdm(dataset, desc="Evaluating")):
-            try:
-                # Get prediction and reasoning trace
-                prediction, reasoning_trace = self._get_prediction_with_trace(example)
-                predictions.append(prediction)
-                reasoning_traces.append(reasoning_trace)
 
-                # Check if correct based on question type
-                is_correct = False
-                question_type = example["question_type"]
-                expected_answer = example.get("answer")
-                print("expected_answer:", expected_answer)
+        # Get number of workers from environment or use default
+        max_workers = int(os.getenv("MAX_CONCURRENCY", "4"))
+        logger.info(f"Using {max_workers} parallel workers for evaluation")
 
-                if (
-                    question_type == "multi_choice"
-                    or question_type == "open_ended_multi_choice"
-                ):
-                    # For multiple choice, compare the choice field
-                    if expected_answer != "":
-                        is_correct = prediction["choice"] == expected_answer
-                    else:
-                        is_correct = False
-                    # Count for accuracy calculation (exclude open_ended)
-                    accuracy_total_count += 1
-                    if is_correct:
-                        accuracy_correct_count += 1
-                elif question_type == "open_ended":
-                    # For open-ended, compare the open_ended_answer field but don't count in accuracy, we have internal evaluation for open-ended questions
-                    if expected_answer != "":
-                        is_correct = prediction["open_ended_answer"] == expected_answer
-                    else:
-                        is_correct = False
-
-                # Log progress
-                if (i + 1) % 10 == 0:
-                    current_acc = (
-                        accuracy_correct_count / accuracy_total_count
-                        if accuracy_total_count > 0
-                        else 0.0
-                    )
-                    logger.info(
-                        f"Progress: {i+1}/{total_count}, Accuracy: {current_acc:.2%} (excluding open-ended)"
-                    )
-
-            except Exception as e:
-                logger.error(f"Error processing example {i}: {e}")
-                error_prediction = {
-                    "choice": "NOTAVALUE",  # Use NOTAVALUE instead of empty string
-                    "open_ended_answer": "Error",
-                }
-                predictions.append(error_prediction)
-                reasoning_traces.append("Error occurred during inference")
+        # Process examples in parallel
+        predictions, reasoning_traces, accuracy_correct_count, accuracy_total_count = (
+            self._evaluate_parallel(dataset, max_workers)
+        )
 
         # Calculate final accuracy (excluding open-ended questions)
         accuracy = (
@@ -547,13 +511,15 @@ class CompetitionKit:
         question = example["question"]
         question_type = example["question_type"]
 
-        # Format prompt
-        if question_type == "multi_choice":
-            prompt = f"The following is a multiple choice question about medicine. Answer with only the letter (A, B, C, D, or E).\n\nQuestion: {question}\n\nAnswer:"
-        elif (
-            question_type == "open_ended_multi_choice" or question_type == "open_ended"
-        ):
-            prompt = f"The following is an open-ended question about medicine. Provide a comprehensive answer.\n\nQuestion: {question}\n\nAnswer:"
+        # # Format prompt
+        # if question_type == "multi_choice":
+        #     prompt = f"The following is a multiple choice question about medicine. Answer with only the letter (A, B, C, D, or E).\n\nQuestion: {question}\n\nAnswer:"
+        # elif (
+        #     question_type == "open_ended_multi_choice" or question_type == "open_ended"
+        # ):
+        #     prompt = f"The following is an open-ended question about medicine. Provide a comprehensive answer.\n\nQuestion: {question}\n\nAnswer:"
+
+        prompt = question
 
         # Get model response and messages using the model's inference method
         response, reasoning_trace = self.model.inference(prompt)
@@ -567,7 +533,8 @@ class CompetitionKit:
         # Extract answer from response
         if question_type == "multi_choice":
             # For multiple choice, extract the letter
-            choice = self._extract_multiple_choice_answer(response)
+            # choice = self._extract_multiple_choice_answer(response)
+            choice = extract_solution(response)
             # Ensure choice is never None or NULL
             prediction["choice"] = (
                 choice if choice and str(choice).upper() not in ["NONE", "NULL"] else ""
@@ -584,7 +551,8 @@ class CompetitionKit:
                 # Combine reasoning traces
                 reasoning_trace += meta_reasoning
                 # Extract the letter choice
-                choice = self._extract_multiple_choice_answer(meta_response)
+                # choice = self._extract_multiple_choice_answer(meta_response)
+                choice = extract_solution(response)
                 # Ensure choice is never None or NULL
                 prediction["choice"] = (
                     choice
@@ -593,7 +561,8 @@ class CompetitionKit:
                 )
             else:
                 # If no meta_question, try to extract choice directly from the response
-                choice = self._extract_multiple_choice_answer(response)
+                # choice = self._extract_multiple_choice_answer(response)
+                choice = extract_solution(response)
                 # Ensure choice is never None or NULL
                 prediction["choice"] = (
                     choice
@@ -608,6 +577,142 @@ class CompetitionKit:
             prediction["open_ended_answer"] = response.strip()
 
         return prediction, reasoning_trace
+
+    def _evaluate_parallel(
+        self, dataset: List[Dict], max_workers: int
+    ) -> Tuple[List[Dict], List[str], int, int]:
+        """
+        Evaluate dataset examples in parallel using ThreadPoolExecutor
+
+        Args:
+            dataset: List of examples to evaluate
+            max_workers: Maximum number of parallel workers
+
+        Returns:
+            Tuple of (predictions, reasoning_traces, accuracy_correct_count, accuracy_total_count)
+        """
+        total_count = len(dataset)
+        predictions = [None] * total_count  # Pre-allocate to maintain order
+        reasoning_traces = [None] * total_count
+
+        # Thread-safe counters
+        accuracy_correct_count = 0
+        accuracy_total_count = 0
+        counter_lock = threading.Lock()
+
+        def process_example_with_index(index_example_tuple):
+            """Process a single example and return results with index for ordering"""
+            i, example = index_example_tuple
+            try:
+                # Get prediction and reasoning trace
+                prediction, reasoning_trace = self._get_prediction_with_trace(example)
+
+                # Check if correct based on question type
+                is_correct = False
+                question_type = example["question_type"]
+                expected_answer = example.get("answer")
+
+                local_accuracy_correct = 0
+                local_accuracy_total = 0
+
+                if (
+                    question_type == "multi_choice"
+                    or question_type == "open_ended_multi_choice"
+                ):
+                    # For multiple choice, compare the choice field
+                    if expected_answer != "":
+                        is_correct = prediction["choice"] == expected_answer
+                    else:
+                        is_correct = False
+                    # Count for accuracy calculation (exclude open_ended)
+                    local_accuracy_total = 1
+                    if is_correct:
+                        local_accuracy_correct = 1
+                elif question_type == "open_ended":
+                    # For open-ended, compare the open_ended_answer field but don't count in accuracy
+                    if expected_answer != "":
+                        is_correct = prediction["open_ended_answer"] == expected_answer
+                    else:
+                        is_correct = False
+
+                return (
+                    i,
+                    prediction,
+                    reasoning_trace,
+                    local_accuracy_correct,
+                    local_accuracy_total,
+                    None,
+                )
+
+            except Exception as e:
+                logger.error(f"Error processing example {i}: {e}")
+                error_prediction = {
+                    "choice": "NOTAVALUE",  # Use NOTAVALUE instead of empty string
+                    "open_ended_answer": "Error",
+                }
+                return (
+                    i,
+                    error_prediction,
+                    "Error occurred during inference",
+                    0,
+                    0,
+                    str(e),
+                )
+
+        # Process examples in parallel with progress tracking
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            indexed_dataset = list(enumerate(dataset))
+
+            # Use tqdm to track progress
+            with tqdm(total=total_count, desc="Evaluating") as pbar:
+                # Submit all jobs
+                future_to_index = {
+                    executor.submit(process_example_with_index, item): item[0]
+                    for item in indexed_dataset
+                }
+
+                # Process completed jobs
+                for future in concurrent.futures.as_completed(future_to_index):
+                    (
+                        index,
+                        prediction,
+                        reasoning_trace,
+                        local_correct,
+                        local_total,
+                        error,
+                    ) = future.result()
+
+                    # Store results in order
+                    predictions[index] = prediction
+                    reasoning_traces[index] = reasoning_trace
+
+                    # Update counters thread-safely
+                    with counter_lock:
+                        accuracy_correct_count += local_correct
+                        accuracy_total_count += local_total
+
+                        # Update progress bar
+                        pbar.update(1)
+
+                        # Log progress every 10 completed examples
+                        if pbar.n % 10 == 0:
+                            current_acc = (
+                                accuracy_correct_count / accuracy_total_count
+                                if accuracy_total_count > 0
+                                else 0.0
+                            )
+                            logger.info(
+                                f"Progress: {pbar.n}/{total_count}, Accuracy: {current_acc:.2%} (excluding open-ended)"
+                            )
+
+        logger.info(f"Parallel evaluation completed. Processed {total_count} examples.")
+        return (
+            predictions,
+            reasoning_traces,
+            accuracy_correct_count,
+            accuracy_total_count,
+        )
 
     def _extract_multiple_choice_answer(self, response: str) -> str:
         """Extract letter answer from model response"""

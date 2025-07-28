@@ -13,8 +13,12 @@ Usage:
     python run.py --config metadata_config.json
 """
 
+from dotenv import load_dotenv
 import os
 from eval_framework import CompetitionKit, load_and_merge_config, create_metadata_parser
+
+
+load_dotenv()
 
 
 def main():
