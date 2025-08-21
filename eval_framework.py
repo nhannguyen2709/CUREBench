@@ -28,25 +28,14 @@ import argparse
 from typing import Dict, List, Optional, Any, Tuple, Callable
 from dataclasses import dataclass
 from tqdm import tqdm
-from abc import ABC, abstractmethod
-import csv
-import importlib
 import concurrent.futures
 import threading
-from functools import partial
+from omegaconf import OmegaConf
+from omegaconf.dictconfig import DictConfig
 
-from my_models.ii_medical_inference import extract_solution
+from models import ChatGPTModel, CustomModel, LocalModel, extract_solution
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
 
-# Suppress HTTP request logs from OpenAI client and related libraries
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("openai").setLevel(logging.WARNING)
-logging.getLogger("urllib3").setLevel(logging.WARNING)
-logging.getLogger("requests").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
@@ -64,228 +53,18 @@ class EvaluationResult:
     details: Optional[Dict] = None
 
 
-# Model Classes
-class BaseModel(ABC):
-    """Abstract base class for all models"""
-
-    def __init__(self, model_name: str):
-        self.model_name = model_name
-        self.model = None
-        self.tokenizer = None
-
-    @abstractmethod
-    def load(self, **kwargs):
-        """Load the model"""
-        pass
-
-    @abstractmethod
-    def inference(self, prompt: str, max_tokens: int = 1024) -> Tuple[str, List[Dict]]:
-        """Run inference on the model
-
-        Returns:
-            Tuple of (response, messages) where messages is the complete conversation history
-        """
-        pass
-
-
-class ChatGPTModel(BaseModel):
-    """ChatGPT/OpenAI model wrapper"""
-
-    def load(self, **kwargs):
-        """Load ChatGPT model"""
-
-        api_key = os.getenv("AZURE_OPENAI_API_KEY_O1")
-        api_version = "2024-12-01-preview"  # "2025-03-01-preview"
-
-        if not api_key:
-            raise ValueError(
-                f"API key not found in environment. Please set the appropriate environment variable."
-            )
-
-        azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-
-        from openai import AzureOpenAI
-
-        print("Initializing AzureOpenAI client with endpoint:", azure_endpoint)
-        print("Using API version:", api_version)
-        self.model_client = AzureOpenAI(
-            azure_endpoint=azure_endpoint,
-            api_key=api_key,
-            api_version=api_version,
-        )
-
-    def inference(self, prompt: str, max_tokens: int = 1024) -> Tuple[str, List[Dict]]:
-        """ChatGPT inference"""
-        messages = [{"role": "user", "content": prompt}]
-
-        responses = self.model_client.chat.completions.create(
-            model=self.model_name,
-            messages=messages,
-            max_completion_tokens=8192,
-        )
-        # print("\033[94m" + str(responses) + "\033[0m")
-        response = responses.choices[0].message.content
-
-        # Create complete conversation history
-        complete_messages = messages + [{"role": "assistant", "content": response}]
-
-        return response, complete_messages
-
-
-class LocalModel(BaseModel):
-    """Local HuggingFace model wrapper"""
-
-    def load(self, **kwargs):
-        """Load local HuggingFace model"""
-        try:
-            from transformers import (
-                AutoTokenizer,
-                AutoModelForCausalLM,
-                BitsAndBytesConfig,
-            )
-            import torch
-
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_name,
-                torch_dtype=torch.bfloat16,
-                device_map="auto",
-                quantization_config=BitsAndBytesConfig(load_in_8bit=True, **kwargs),
-            )
-            logger.info(f"Loaded local model: {self.model_name}")
-        except ImportError as e:
-            logger.error(f"Failed to import local model dependencies: {e}")
-            raise
-
-    def inference(self, prompt: str, max_tokens: int = 1024) -> Tuple[str, List[Dict]]:
-        """Local model inference"""
-        messages = [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": prompt},
-        ]
-
-        print("messages:", messages)
-
-        input_ids = self.tokenizer.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            return_tensors="pt",
-            enable_thinking=False,
-        ).to(self.model.device)
-
-        outputs = self.model.generate(
-            input_ids,
-            temperature=0.4,
-            top_p=0.9,
-            max_new_tokens=max_tokens,
-            pad_token_id=self.tokenizer.eos_token_id,
-            do_sample=False,
-        )
-
-        response = outputs[0][input_ids.shape[-1] :]
-        response_text = self.tokenizer.decode(response, skip_special_tokens=True)
-        print("response_text:", response_text)
-        # Create complete conversation history
-        complete_messages = messages + [{"role": "assistant", "content": response_text}]
-
-        return response_text, complete_messages
-
-
-class CustomModel(BaseModel):
-    """Custom model wrapper for user-defined models"""
-
-    def __init__(
-        self,
-        model_name: str,
-        model_instance: Any,
-        inference_func: Callable,
-    ):
-        super().__init__(model_name)
-        self.model = model_instance
-        self._inference_func = inference_func
-
-    def load(self, **kwargs):
-        """Custom models are already loaded"""
-        logger.info(f"Using custom model: {self.model_name}")
-
-    def inference(self, prompt: str, max_tokens: int = 4096) -> Tuple[str, List[Dict]]:
-        """Custom model inference"""
-        try:
-            # For custom models, we'll create a simple message structure
-            messages = [{"role": "user", "content": prompt}]
-
-            response = self._inference_func(self.model, prompt, max_tokens)
-
-            # Create complete conversation history
-            complete_messages = messages + [{"role": "assistant", "content": response}]
-
-            return response, complete_messages
-        except Exception as e:
-            logger.error(f"Custom model inference error: {e}")
-            error_messages = [
-                {"role": "user", "content": prompt},
-                {"role": "assistant", "content": "Error occurred"},
-            ]
-            return "Error occurred", error_messages
-
-
-def import_function_from_string(func_string: str) -> Callable:
-    """
-    Import a function from a string reference like 'module.submodule.function_name'
-
-    Args:
-        func_string: String in format 'module.submodule.function_name'
-
-    Returns:
-        The imported function
-
-    Raises:
-        ImportError: If module or function cannot be imported
-        AttributeError: If function doesn't exist in module
-    """
-    if not func_string or "." not in func_string:
-        raise ValueError(f"Invalid function string format: {func_string}")
-
-    # Split module path and function name
-    module_path, func_name = func_string.rsplit(".", 1)
-
-    try:
-        # Import the module
-        module = importlib.import_module(module_path)
-        # Get the function from the module
-        func = getattr(module, func_name)
-
-        if not callable(func):
-            raise ValueError(f"'{func_string}' is not callable")
-
-        return func
-    except ImportError as e:
-        raise ImportError(f"Cannot import module '{module_path}': {e}")
-    except AttributeError as e:
-        raise AttributeError(
-            f"Function '{func_name}' not found in module '{module_path}': {e}"
-        )
-
-
 class CompetitionKit:
     """
     Simple competition framework - everything you need in one class!
     """
 
-    def __init__(self, config_path: str = None):
+    def __init__(self, config: DictConfig):
         """
-        Initialize the competition kit
-
-        Args:
-            output_dir: Directory to save results and submissions
-            config_path: Path to configuration file containing dataset configs
+        Initialize the competition kit.
         """
-        self.model = None
-        self.model_name = None
-
-        self.config = json.load(open(config_path, "r")) if config_path else {}
-
-        self.output_dir = self.config.get("output_dir", "results")
+        self.config = config
+        self.output_dir = self.config.output.dir
+        self.model_name = self.config.model.model_name
 
         # Create output directory
         os.makedirs(self.output_dir, exist_ok=True)
@@ -293,69 +72,29 @@ class CompetitionKit:
         # Load dataset configurations from config file or use defaults
         self.datasets = self._load_dataset_configs(self.config)
 
-    def load_model(self, model_name: str, model_type: str = "auto", **kwargs):
+    def load_model(self):
         """
-        Load a model for evaluation
-
-        Args:
-            model_name: Name/path of the model (e.g., "gpt-4o-mini", "meta-llama/Llama-2-7b-chat-hf")
-            model_type: Type of model ("chatgpt", "local", "custom", "auto" for auto-detection)
-            **kwargs: Additional model configuration
+        Load a model for evaluation.
         """
-        self.model_name = model_name
-
-        # Auto-detect model type if not specified
-        if model_type == "auto":
-            model_type = self._detect_model_type(model_name)
-
-        logger.info(f"Loading model: {model_name} (type: {model_type})")
+        config = self.config.model
+        model_name = config.model_name
+        model_type = config.model_type
+        base_url = config.base_url
+        api_key = config.api_key
+        sampling = config.sampling
 
         if model_type == "chatgpt":
             self.model = ChatGPTModel(model_name)
         elif model_type == "local":
             self.model = LocalModel(model_name)
         elif model_type == "custom":
-            # For custom models, user should provide model_instance and inference_func
-            # First check kwargs, then check config metadata
-            model_instance = kwargs.get("model_instance")
-            inference_func = kwargs.get("inference_func")
-            model_instance_factory = kwargs.get("model_instance_factory")
+            from functools import partial
+            from models import create_model_instance, inference_function
 
-            # If not provided in kwargs, try to get from config metadata
-            if self.config and "metadata" in self.config:
-                metadata = self.config["metadata"]
-                if not inference_func and "inference_func" in metadata:
-                    inference_func = metadata["inference_func"]
-                if not model_instance_factory and "model_instance_factory" in metadata:
-                    model_instance_factory = metadata["model_instance_factory"]
-
-            # Handle model_instance - can be direct object or factory function string
-            if not model_instance:
-                if model_instance_factory:
-                    if isinstance(model_instance_factory, str):
-                        factory_func = import_function_from_string(
-                            model_instance_factory
-                        )
-                        model_instance = factory_func()
-                    else:
-                        model_instance = model_instance_factory()
-
-            # Handle inference_func - can be direct function or string reference
-            if isinstance(inference_func, str):
-                inference_func = import_function_from_string(inference_func)
-
-            if not model_instance or not inference_func:
-                raise ValueError(
-                    "Custom model requires 'model_instance' and 'inference_func' parameters. "
-                    "You can provide them directly as kwargs, use 'model_instance_factory' and string references, "
-                    "or specify them in the config file metadata section."
-                )
-            self.model = CustomModel(model_name, model_instance, inference_func)
+            model_instance = create_model_instance(model_name, base_url, api_key)
+            self.model = CustomModel(model_name, model_instance, partial(inference_function, sampling=sampling))
         else:
             raise ValueError(f"Unknown model type: {model_type}")
-
-        # Load the model
-        self.model.load(**kwargs)
 
     def _load_dataset_configs(self, config) -> Dict:
         """
@@ -373,24 +112,14 @@ class CompetitionKit:
 
         # Check if config has a single dataset configuration
         if "dataset" in config:
-            dataset_config = config["dataset"]
-            dataset_name = dataset_config.get("dataset_name", "treatment")
+            dataset_config = config.dataset
+            dataset_name = dataset_config.name
             # Create a dictionary with the dataset name as key
             return {dataset_name: dataset_config}
         else:
             # If no dataset in config, return defaults
             print("Not config found, existing.")
             exit(1)
-
-    def _detect_model_type(self, model_name: str) -> str:
-        """Auto-detect model type based on model name"""
-        if any(
-            name in model_name.lower()
-            for name in ["gpt", "chatgpt", "openai", "o1", "o3", "o4"]
-        ):
-            return "chatgpt"
-        else:
-            return "local"
 
     def evaluate(self, dataset_name: str) -> EvaluationResult:
         """
@@ -415,6 +144,8 @@ class CompetitionKit:
 
         # Load dataset
         dataset = self._load_dataset(dataset_config)
+        if self.config.evaluation.subset_size is not None:
+            dataset = dataset[:self.config.evaluation.subset_size]
 
         # Store dataset examples for later use in save_submission
         self._last_dataset_examples = dataset
@@ -424,7 +155,7 @@ class CompetitionKit:
         logger.info(f"Running evaluation on {total_count} examples...")
 
         # Get number of workers from environment or use default
-        max_workers = int(os.getenv("MAX_CONCURRENCY", "4"))
+        max_workers = self.config.evaluation.max_workers
         logger.info(f"Using {max_workers} parallel workers for evaluation")
 
         # Process examples in parallel
@@ -458,71 +189,13 @@ class CompetitionKit:
 
         return result
 
-    def _load_dataset(self, dataset_config: Dict) -> List[Dict]:
-        """Load dataset based on configuration"""
-        from dataset_utils import build_dataset
-        from torch.utils.data import DataLoader
-
-        # Build dataset
-        dataset = build_dataset(
-            dataset_config.get("dataset_path"),
-        )
-
-        # Convert to list of dictionaries for easier processing
-        dataloader = DataLoader(dataset, batch_size=1, shuffle=False)
-        dataset_list = []
-
-        for batch in dataloader:
-            question_type = batch[0][0]
-
-            if question_type == "multi_choice":
-                dataset_list.append(
-                    {
-                        "question_type": batch[0][0],
-                        "id": batch[1][0],
-                        "question": batch[2][0],
-                        "answer": batch[3][0],
-                    }
-                )
-            elif question_type == "open_ended_multi_choice":
-                dataset_list.append(
-                    {
-                        "question_type": batch[0][0],
-                        "id": batch[1][0],
-                        "question": batch[2][0],
-                        "answer": batch[3][0],
-                        "meta_question": batch[4][0],
-                    }
-                )
-            elif question_type == "open_ended":
-                dataset_list.append(
-                    {
-                        "question_type": batch[0][0],
-                        "id": batch[1][0],
-                        "question": batch[2][0],
-                        "answer": batch[3][0],
-                    }
-                )
-
-        return dataset_list
-
     def _get_prediction_with_trace(self, example: Dict) -> Tuple[Dict, str]:
         """Get model prediction and reasoning trace for a single example"""
         question = example["question"]
         question_type = example["question_type"]
 
-        # # Format prompt
-        # if question_type == "multi_choice":
-        #     prompt = f"The following is a multiple choice question about medicine. Answer with only the letter (A, B, C, D, or E).\n\nQuestion: {question}\n\nAnswer:"
-        # elif (
-        #     question_type == "open_ended_multi_choice" or question_type == "open_ended"
-        # ):
-        #     prompt = f"The following is an open-ended question about medicine. Provide a comprehensive answer.\n\nQuestion: {question}\n\nAnswer:"
-
-        prompt = question
-
         # Get model response and messages using the model's inference method
-        response, reasoning_trace = self.model.inference(prompt)
+        response, reasoning_trace = self.model.inference(question, self.config.model.config.max_tokens)
 
         # Initialize prediction dictionary
         prediction = {
@@ -531,7 +204,10 @@ class CompetitionKit:
         }
 
         # Extract answer from response
-        if question_type == "multi_choice":
+        if (
+            question_type == "multi_choice"
+            or question_type == "open_ended_multi_choice"
+        ):
             # For multiple choice, extract the letter
             # choice = self._extract_multiple_choice_answer(response)
             choice = extract_solution(response)
@@ -540,35 +216,6 @@ class CompetitionKit:
                 choice if choice and str(choice).upper() not in ["NONE", "NULL"] else ""
             )
             prediction["open_ended_answer"] = response.strip()  # Keep full response too
-        elif question_type == "open_ended_multi_choice":
-            # First get the detailed response
-            prediction["open_ended_answer"] = response.strip()
-
-            # Then use meta question to get choice, if available
-            if "meta_question" in example:
-                meta_prompt = f"{example['meta_question']}Agent's answer: {response.strip()}\n\nMulti-choice answer:"
-                meta_response, meta_reasoning = self.model.inference(meta_prompt)
-                # Combine reasoning traces
-                reasoning_trace += meta_reasoning
-                # Extract the letter choice
-                # choice = self._extract_multiple_choice_answer(meta_response)
-                choice = extract_solution(response)
-                # Ensure choice is never None or NULL
-                prediction["choice"] = (
-                    choice
-                    if choice and str(choice).upper() not in ["NONE", "NULL"]
-                    else ""
-                )
-            else:
-                # If no meta_question, try to extract choice directly from the response
-                # choice = self._extract_multiple_choice_answer(response)
-                choice = extract_solution(response)
-                # Ensure choice is never None or NULL
-                prediction["choice"] = (
-                    choice
-                    if choice and str(choice).upper() not in ["NONE", "NULL"]
-                    else ""
-                )
         elif question_type == "open_ended":
             # For open-ended, only return response, use N/A for choice to avoid empty string issues
             prediction["choice"] = (
@@ -714,33 +361,51 @@ class CompetitionKit:
             accuracy_total_count,
         )
 
-    def _extract_multiple_choice_answer(self, response: str) -> str:
-        """Extract letter answer from model response"""
-        if not response or response is None:
-            return ""
+    def _load_dataset(self, dataset_config: Dict) -> List[Dict]:
+        """Load dataset based on configuration"""
+        from dataset_utils import build_dataset
+        from torch.utils.data import DataLoader
 
-        response = response.strip().upper()
+        # Build dataset
+        dataset = build_dataset(dataset_config.path)
 
-        # Look for letter at the beginning
-        if response and response[0] in ["A", "B", "C", "D", "E"]:
-            return response[0]
+        # Convert to list of dictionaries for easier processing
+        dataloader = DataLoader(dataset, batch_size=1, shuffle=False)
+        dataset_list = []
 
-        # Look for "The answer is X" patterns
-        import re
+        for batch in dataloader:
+            question_type = batch[0][0]
 
-        patterns = [
-            r"(?:answer is|answer:|is)\s*([ABCDE])",
-            r"([ABCDE])\)",
-            r"\b([ABCDE])\b",
-        ]
+            if question_type == "multi_choice":
+                dataset_list.append(
+                    {
+                        "question_type": batch[0][0],
+                        "id": batch[1][0],
+                        "question": batch[2][0],
+                        "answer": batch[3][0],
+                    }
+                )
+            elif question_type == "open_ended_multi_choice":
+                dataset_list.append(
+                    {
+                        "question_type": batch[0][0],
+                        "id": batch[1][0],
+                        "question": batch[2][0],
+                        "answer": batch[3][0],
+                        "meta_question": batch[4][0],
+                    }
+                )
+            elif question_type == "open_ended":
+                dataset_list.append(
+                    {
+                        "question_type": batch[0][0],
+                        "id": batch[1][0],
+                        "question": batch[2][0],
+                        "answer": batch[3][0],
+                    }
+                )
 
-        for pattern in patterns:
-            match = re.search(pattern, response)
-            if match:
-                return match.group(1)
-
-        # Default to empty string if nothing found (to avoid None values in CSV)
-        return ""
+        return dataset_list
 
     def save_submission(
         self,
@@ -1046,23 +711,14 @@ class CompetitionKit:
 
         _, ext = os.path.splitext(config_path)
 
-        with open(config_path, "r") as f:
-            if ext.lower() in [".json"]:
-                config = json.load(f)
-            elif ext.lower() in [".yaml", ".yml"]:
-                try:
-                    import yaml
-
-                    config = yaml.safe_load(f)
-                except ImportError:
-                    raise ImportError(
-                        "PyYAML is required for YAML config files. Install with: pip install PyYAML"
-                    )
-            else:
-                raise ValueError(f"Unsupported config file format: {ext}")
+        # Use OmegaConf to load both JSON and YAML files
+        try:
+            config = OmegaConf.load(config_path)
+        except Exception as e:
+            raise ValueError(f"Failed to load config file {config_path}: {e}")
 
         # Extract metadata from config
-        metadata = config.get("metadata", config.get("meta_data", {}))
+        metadata = OmegaConf.to_container(config.get("metadata", config.get("meta_data", {})), resolve=True)
 
         # Validate required fields
         required_fields = [
@@ -1162,113 +818,15 @@ class CompetitionKit:
         return metadata
 
 
-def create_metadata_parser() -> argparse.ArgumentParser:
-    """
-    Create command line argument parser for metadata
-
-    Returns:
-        ArgumentParser with metadata-related arguments
-    """
-    parser = argparse.ArgumentParser(
-        description="Evaluation Framework with Metadata Support"
-    )
-
-    # Model information
-    parser.add_argument("--model-name", type=str, help="Name of the model")
-    parser.add_argument("--model-type", type=str, help="Type of model wrapper")
-    parser.add_argument("--base-model-name", type=str, help="Name of the base model")
-    parser.add_argument(
-        "--base-model-type",
-        type=str,
-        choices=["API", "OpenWeighted"],
-        help="Type of base model (API or OpenWeighted)",
-    )
-
-    # Track information
-    parser.add_argument(
-        "--track",
-        type=str,
-        choices=["internal_reasoning", "agentic_reasoning"],
-        default="internal_reasoning",
-        help="Competition track",
-    )
-
-    # Dataset and submission info
-    parser.add_argument("--dataset", type=str, help="Dataset name")
-    parser.add_argument(
-        "--additional-info",
-        type=str,
-        help="Additional information about the submission",
-    )
-
-    # Configuration file
-    parser.add_argument(
-        "--config", type=str, help="Path to configuration file (JSON or YAML)"
-    )
-
-    # Output settings
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default="competition_results",
-        help="Output directory for results",
-    )
-    parser.add_argument(
-        "--output-file",
-        type=str,
-        default="submission.csv",
-        help="Output CSV filename for submission (will be packaged in zip)",
-    )
-
-    # Evaluation settings
-    parser.add_argument(
-        "--subset-size", type=int, help="Limit evaluation to N examples"
-    )
-
-    return parser
-
-
 def load_config_file(config_path):
-    """Load configuration from JSON file"""
+    """Load configuration from YAML or JSON file using OmegaConf"""
     if not os.path.exists(config_path):
         print(f"❌ Error: Configuration file not found: {config_path}")
         sys.exit(1)
 
     try:
-        with open(config_path, "r") as f:
-            return json.load(f)
+        config = OmegaConf.load(config_path)
+        return OmegaConf.to_container(config, resolve=True)
     except Exception as e:
         print(f"❌ Error loading config file {config_path}: {e}")
         sys.exit(1)
-
-
-def load_and_merge_config(args):
-    """Load config file and merge values into args. Command line args take precedence."""
-    if not args.config:
-        return args
-
-    config = load_config_file(args.config)
-
-    # First, handle the metadata section specially - merge its contents directly
-    if "metadata" in config:
-        metadata = config["metadata"]
-        for key, value in metadata.items():
-            if not hasattr(args, key) or getattr(args, key) is None:
-                setattr(args, key, value)
-
-    # Then handle all other config values, flattening nested structures
-    def add_config_to_args(config_dict, prefix=""):
-        for key, value in config_dict.items():
-            if key in [
-                "metadata",
-                "dataset",
-            ]:  # Skip metadata and dataset as we handle them specially
-                continue
-            attr_name = f"{prefix}_{key}" if prefix else key
-            if isinstance(value, dict):
-                add_config_to_args(value, attr_name)
-            elif not hasattr(args, attr_name) or getattr(args, attr_name) is None:
-                setattr(args, attr_name, value)
-
-    add_config_to_args(config)
-    return args

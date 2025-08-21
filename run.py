@@ -1,88 +1,71 @@
 #!/usr/bin/env python3
 """
-Bio-Medical AI Competition - Evaluation Script
+Bio-Medical AI Competition - Hydra-powered Evaluation Script
 
-Simple evaluation script that supports metadata configuration
-via command line arguments and configuration files.
+Advanced evaluation script using Hydra for configuration management.
 
 Usage:
-    # Basic usage
-    python run.py                                      # Run with defaults
+    # Basic usage with defaults
+    python run.py
 
-    # With metadata via config file
-    python run.py --config metadata_config.json
+    # Override configuration groups
+    python run.py model=ii_medical_7b                  # Use 7B model
+    python run.py dataset=cure_bench_test              # Use test dataset
+    
+    # Override specific nested values
+    python run.py model.config.temperature=0.7        # Override model temperature
+    python run.py evaluation.max_workers=8            # Override worker count
+    
+    # Complex combinations
+    python run.py model=ii_medical_7b dataset=cure_bench_test evaluation.max_workers=8 output.dir=results
+    
+    # View configuration
+    python run.py --cfg job                           # Show resolved config
+    python run.py --help                              # Show all options
 """
 
-from dotenv import load_dotenv
 import os
-from eval_framework import CompetitionKit, load_and_merge_config, create_metadata_parser
+from dotenv import load_dotenv
+import hydra
+from omegaconf import DictConfig, OmegaConf
+from eval_framework import CompetitionKit
 
 
 load_dotenv()
 
 
-def main():
-    # Create argument parser with metadata support
-    parser = create_metadata_parser()
-
-    args = parser.parse_args()
-
-    # Load configuration from config file if provided and merge with args
-    args = load_and_merge_config(args)
-
-    # Extract values dynamically with fallback defaults
-    output_file = getattr(args, "output_file", "submission.csv")
-    dataset_name = getattr(args, "dataset")
-    model_name = getattr(args, "model_path", None) or getattr(args, "model_name", None)
-    model_type = getattr(args, "model_type", "auto")
-
-    """Run evaluation with metadata support"""
-    print("\n" + "=" * 60)
-    print("🏥 CURE-Bench Competition - Evaluation")
-    print("=" * 60)
+@hydra.main(version_base=None, config_path=".", config_name="config")
+def main(config: DictConfig) -> None:
+    """Run evaluation with Hydra configuration management"""    
+    # Print the resolved configuration
+    print("📋 Resolved Configuration:")
 
     # Initialize the competition kit
-    config_path = getattr(args, "config", None)
-    # Use metadata_config.json as default if no config is specified
-    if not config_path:
-        default_config = "metadata_config.json"
-        if os.path.exists(default_config):
-            config_path = default_config
-
-    kit = CompetitionKit(config_path=config_path)
-
-    print(f"Loading model: {model_name}")
-    kit.load_model(model_name, model_type)
-
+    kit = CompetitionKit(config=config)
+    
+    print(f"Loading model: {config.model.model_name}")
+    kit.load_model()
+    
     # Show available datasets
     print("Available datasets:")
     kit.list_datasets()
-
+    
     # Run evaluation
-    print(f"Running evaluation on dataset: {dataset_name}")
-
-    results = kit.evaluate(dataset_name)
-
-    # Generate submission with metadata from config/args
+    print(f"Running evaluation on dataset: {config.dataset.name}")
+    results = kit.evaluate(config.dataset.name)
+    
+    # Generate submission with metadata from config
     print("Generating submission with metadata...")
     submission_path = kit.save_submission_with_metadata(
         results=[results],
-        filename=output_file,
-        config_path=getattr(args, "config", None),
-        args=args,
+        filename=config.output.file,
     )
-
+    
     print(f"\n✅ Evaluation completed successfully!")
     print(
         f"📊 Accuracy: {results.accuracy:.2%} ({results.correct_predictions}/{results.total_examples})"
     )
     print(f"📄 Submission saved to: {submission_path}")
-
-    # Show metadata summary if verbose
-    final_metadata = kit.get_metadata(getattr(args, "config", None), args)
-    print("\n📋 Final metadata:")
-    for key, value in final_metadata.items():
-        print(f"  {key}: {value}")
 
 
 if __name__ == "__main__":

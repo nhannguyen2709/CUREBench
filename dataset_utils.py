@@ -131,7 +131,7 @@ class CureBenchDataset(Dataset):
             options_list = "\n".join(
                 [f"{opt}: {options[opt]}" for opt in sorted(options.keys())]
             )
-            question = f"{question}"
+            question = f"{question}\n{options_list}"
             meta_question = f"The following is a multiple choice question about medicine and the agent's open-ended answer to the question. Convert the agent's answer to the final answer format using the corresponding option label, e.g., 'A', 'B', 'C', 'D', 'E' or 'None'. \n\nQuestion: {question}\n{options_list}\n\n"
             return question_type, id_value, question, answer, meta_question
         elif question_type == "open_ended":
