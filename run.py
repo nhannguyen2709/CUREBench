@@ -25,6 +25,7 @@ Usage:
 """
 
 import os
+import asyncio
 from dotenv import load_dotenv
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -37,6 +38,11 @@ load_dotenv()
 @hydra.main(version_base=None, config_path=".", config_name="config")
 def main(config: DictConfig) -> None:
     """Run evaluation with Hydra configuration management"""    
+    asyncio.run(async_main(config))
+
+
+async def async_main(config: DictConfig) -> None:
+    """Async main function for evaluation"""
     # Print the resolved configuration
     print("📋 Resolved Configuration:")
 
@@ -52,7 +58,7 @@ def main(config: DictConfig) -> None:
     
     # Run evaluation
     print(f"Running evaluation on dataset: {config.dataset.name}")
-    results = kit.evaluate(config.dataset.name)
+    results = await kit.evaluate(config.dataset.name)
     
     # Generate submission with metadata from config
     print("Generating submission with metadata...")

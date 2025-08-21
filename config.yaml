@@ -1,0 +1,51 @@
+# Model configuration
+model:
+  model_type: "custom"
+  model_name: "Intelligent-Internet/II-Medical-8B-1706"
+  base_model_type: "OpenWeighted" # API or OpenWeighted
+  base_url: "http://localhost:8000/v1"
+  api_key: "EMPTY"
+
+  sampling:
+    temperature: 0.6
+    top_p: 0.95
+    max_tokens: 40960
+    reasoning:
+      effort: "high"
+  
+  # transformers config
+  config:
+    quantization:
+      enabled: true
+      bits: 8
+    device_map: "auto"
+    torch_dtype: "bfloat16"
+    max_tokens: 16384
+    temperature: 0.4
+
+# Dataset configuration
+dataset:
+  name: "cure_bench_phase_1"
+  path: "data/curebench_valset_phase1.jsonl"
+  description: "CureBench 2025 validation questions"
+  track: "internal_reasoning"
+
+# Evaluation settings
+evaluation:
+  max_workers: 4
+  batch_size: 1
+  subset_size: null  # null means use all examples
+
+# Output configuration
+output:
+  dir: "results"
+  file: "submission.csv"
+  additional_info: "Unified YAML configuration"
+
+# Hydra configuration
+hydra:
+  run:
+    dir: ./hydra_outputs/${now:%Y-%m-%d_%H-%M-%S}
+  sweep:
+    dir: ./hydra_multirun/${now:%Y-%m-%d_%H-%M-%S}
+    subdir: ${hydra:job.num}
