@@ -25,32 +25,16 @@ import os
 import sys
 import logging
 import argparse
-from typing import Dict, List, Optional, Any, Tuple, Callable
-from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 from tqdm import tqdm
-import concurrent.futures
-import threading
+import asyncio
 from omegaconf import OmegaConf
 from omegaconf.dictconfig import DictConfig
 
-from models import ChatGPTModel, CustomModel, LocalModel, extract_solution
-
+from models import ChatGPTModel, CustomModel, LocalModel
+from eval_utils import EvaluationResult, process_example
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class EvaluationResult:
-    """Simple container for evaluation results"""
-
-    dataset_name: str
-    model_name: str
-    accuracy: float
-    correct_predictions: int
-    total_examples: int
-    predictions: List[Dict]  # Changed from List[str] to List[Dict]
-    reasoning_traces: List[str] = None  # Add reasoning traces
-    details: Optional[Dict] = None
 
 
 class CompetitionKit:
@@ -92,7 +76,7 @@ class CompetitionKit:
             from models import create_model_instance, inference_function
 
             model_instance = create_model_instance(model_name, base_url, api_key)
-            self.model = CustomModel(model_name, model_instance, partial(inference_function, sampling=sampling))
+            self.model = CustomModel(model_name, model_instance, partial(inference_function, sampling_params=sampling))
         else:
             raise ValueError(f"Unknown model type: {model_type}")
 
@@ -121,7 +105,7 @@ class CompetitionKit:
             print("Not config found, existing.")
             exit(1)
 
-    def evaluate(self, dataset_name: str) -> EvaluationResult:
+    async def evaluate(self, dataset_name: str) -> EvaluationResult:
         """
         Evaluate model on a dataset
 
@@ -160,7 +144,7 @@ class CompetitionKit:
 
         # Process examples in parallel
         predictions, reasoning_traces, accuracy_correct_count, accuracy_total_count = (
-            self._evaluate_parallel(dataset, max_workers)
+            await self._evaluate_parallel(dataset, max_workers)
         )
 
         # Calculate final accuracy (excluding open-ended questions)
@@ -189,47 +173,11 @@ class CompetitionKit:
 
         return result
 
-    def _get_prediction_with_trace(self, example: Dict) -> Tuple[Dict, str]:
-        """Get model prediction and reasoning trace for a single example"""
-        question = example["question"]
-        question_type = example["question_type"]
-
-        # Get model response and messages using the model's inference method
-        response, reasoning_trace = self.model.inference(question, self.config.model.config.max_tokens)
-
-        # Initialize prediction dictionary
-        prediction = {
-            "choice": "",  # Use empty string instead of None
-            "open_ended_answer": "",  # Use empty string instead of None
-        }
-
-        # Extract answer from response
-        if (
-            question_type == "multi_choice"
-            or question_type == "open_ended_multi_choice"
-        ):
-            # For multiple choice, extract the letter
-            # choice = self._extract_multiple_choice_answer(response)
-            choice = extract_solution(response)
-            # Ensure choice is never None or NULL
-            prediction["choice"] = (
-                choice if choice and str(choice).upper() not in ["NONE", "NULL"] else ""
-            )
-            prediction["open_ended_answer"] = response.strip()  # Keep full response too
-        elif question_type == "open_ended":
-            # For open-ended, only return response, use N/A for choice to avoid empty string issues
-            prediction["choice"] = (
-                "NOTAVALUE"  # Use N/A instead of empty string to avoid NULL validation issues
-            )
-            prediction["open_ended_answer"] = response.strip()
-
-        return prediction, reasoning_trace
-
-    def _evaluate_parallel(
+    async def _evaluate_parallel(
         self, dataset: List[Dict], max_workers: int
     ) -> Tuple[List[Dict], List[str], int, int]:
         """
-        Evaluate dataset examples in parallel using ThreadPoolExecutor
+        Evaluate dataset examples in parallel using asyncio
 
         Args:
             dataset: List of examples to evaluate
@@ -239,127 +187,38 @@ class CompetitionKit:
             Tuple of (predictions, reasoning_traces, accuracy_correct_count, accuracy_total_count)
         """
         total_count = len(dataset)
-        predictions = [None] * total_count  # Pre-allocate to maintain order
+        predictions = [None] * total_count
         reasoning_traces = [None] * total_count
-
-        # Thread-safe counters
         accuracy_correct_count = 0
         accuracy_total_count = 0
-        counter_lock = threading.Lock()
 
-        def process_example_with_index(index_example_tuple):
-            """Process a single example and return results with index for ordering"""
-            i, example = index_example_tuple
-            try:
-                # Get prediction and reasoning trace
-                prediction, reasoning_trace = self._get_prediction_with_trace(example)
+        # Create semaphore to limit concurrent tasks
+        semaphore = asyncio.Semaphore(max_workers)
 
-                # Check if correct based on question type
-                is_correct = False
-                question_type = example["question_type"]
-                expected_answer = example.get("answer")
+        async def process_with_semaphore(i, model, example):
+            async with semaphore:
+                return await process_example(i, model, example)
 
-                local_accuracy_correct = 0
-                local_accuracy_total = 0
+        # Process all examples with progress tracking
+        with tqdm(total=total_count, desc="Evaluating") as pbar:
+            tasks = []
+            for i, example in enumerate(dataset):
+                tasks.append(process_with_semaphore(i, self.model, example))
 
-                if (
-                    question_type == "multi_choice"
-                    or question_type == "open_ended_multi_choice"
-                ):
-                    # For multiple choice, compare the choice field
-                    if expected_answer != "":
-                        is_correct = prediction["choice"] == expected_answer
-                    else:
-                        is_correct = False
-                    # Count for accuracy calculation (exclude open_ended)
-                    local_accuracy_total = 1
-                    if is_correct:
-                        local_accuracy_correct = 1
-                elif question_type == "open_ended":
-                    # For open-ended, compare the open_ended_answer field but don't count in accuracy
-                    if expected_answer != "":
-                        is_correct = prediction["open_ended_answer"] == expected_answer
-                    else:
-                        is_correct = False
+            for future in asyncio.as_completed(tasks):
+                i, prediction, reasoning_trace, local_correct, local_total = await future
+                
+                predictions[i] = prediction
+                reasoning_traces[i] = reasoning_trace
+                accuracy_correct_count += local_correct
+                accuracy_total_count += local_total
 
-                return (
-                    i,
-                    prediction,
-                    reasoning_trace,
-                    local_accuracy_correct,
-                    local_accuracy_total,
-                    None,
-                )
-
-            except Exception as e:
-                logger.error(f"Error processing example {i}: {e}")
-                error_prediction = {
-                    "choice": "NOTAVALUE",  # Use NOTAVALUE instead of empty string
-                    "open_ended_answer": "Error",
-                }
-                return (
-                    i,
-                    error_prediction,
-                    "Error occurred during inference",
-                    0,
-                    0,
-                    str(e),
-                )
-
-        # Process examples in parallel with progress tracking
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all tasks
-            indexed_dataset = list(enumerate(dataset))
-
-            # Use tqdm to track progress
-            with tqdm(total=total_count, desc="Evaluating") as pbar:
-                # Submit all jobs
-                future_to_index = {
-                    executor.submit(process_example_with_index, item): item[0]
-                    for item in indexed_dataset
-                }
-
-                # Process completed jobs
-                for future in concurrent.futures.as_completed(future_to_index):
-                    (
-                        index,
-                        prediction,
-                        reasoning_trace,
-                        local_correct,
-                        local_total,
-                        error,
-                    ) = future.result()
-
-                    # Store results in order
-                    predictions[index] = prediction
-                    reasoning_traces[index] = reasoning_trace
-
-                    # Update counters thread-safely
-                    with counter_lock:
-                        accuracy_correct_count += local_correct
-                        accuracy_total_count += local_total
-
-                        # Update progress bar
-                        pbar.update(1)
-
-                        # Log progress every 10 completed examples
-                        if pbar.n % 10 == 0:
-                            current_acc = (
-                                accuracy_correct_count / accuracy_total_count
-                                if accuracy_total_count > 0
-                                else 0.0
-                            )
-                            logger.info(
-                                f"Progress: {pbar.n}/{total_count}, Accuracy: {current_acc:.2%} (excluding open-ended)"
-                            )
+                pbar.update(1)
+                if pbar.n % 50 == 0:
+                    logger.info(f"Correct: {accuracy_correct_count}, Total: {accuracy_total_count}")
 
         logger.info(f"Parallel evaluation completed. Processed {total_count} examples.")
-        return (
-            predictions,
-            reasoning_traces,
-            accuracy_correct_count,
-            accuracy_total_count,
-        )
+        return predictions, reasoning_traces, accuracy_correct_count, accuracy_total_count
 
     def _load_dataset(self, dataset_config: Dict) -> List[Dict]:
         """Load dataset based on configuration"""
