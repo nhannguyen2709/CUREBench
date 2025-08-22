@@ -254,7 +254,7 @@ def inference_function(
             max_completion_tokens=sampling_params["max_tokens"],
             extra_body={"chat_template_kwargs": {"add_generation_prompt": True, "enable_thinking": True}}
         )
-        import pdb; pdb.set_trace()
+        return response.choices[0].message.content
 
 
 def extract_boxed_text(text, extract_mc_letter=True):
@@ -269,9 +269,15 @@ def extract_boxed_text(text, extract_mc_letter=True):
     Returns:
         The extracted content or empty string if no match
     """
-    # Fix the pattern to include the backslash
-    pattern = r"oxed{(.*?)}"
-    matches = re.findall(pattern, text)
+    # Pattern to match both \boxed{...} and boxed{...} (missing leading backslash)
+    patterns = [
+        r"\\boxed\{(.*?)\}",  # Standard \boxed{...}
+        r"boxed\{(.*?)\}"     # Outlier case boxed{...} (missing leading backslash)
+    ]
+    
+    matches = []
+    for pattern in patterns:
+        matches.extend(re.findall(pattern, text))
 
     if not matches:
         return ""
@@ -280,16 +286,29 @@ def extract_boxed_text(text, extract_mc_letter=True):
         if match == "":
             continue
 
+        # Handle \text{...} commands within the boxed content
+        processed_match = match
+        # Handle both complete \text{...} and incomplete \text{... (missing closing brace)
+        text_patterns = [
+            r"\\text\{([^}]*)\}",  # Complete \text{content}
+            r"\\text\{([^}]*)$"    # Incomplete \text{content (missing closing brace at end)
+        ]
+        
+        for text_pattern in text_patterns:
+            text_matches = re.findall(text_pattern, processed_match)
+            for text_content in text_matches:
+                processed_match = re.sub(text_pattern, text_content, processed_match, count=1)
+
         if extract_mc_letter:
             # Try to extract just the letter for multiple choice
             # Match patterns like: A, A., (A), A:, A), etc.
             mc_pattern = r"^([A-Z])[\.:\)\s]|^\(([A-Z])\)|^([A-Z])$"
-            mc_match = re.search(mc_pattern, match.strip())
+            mc_match = re.search(mc_pattern, processed_match.strip())
             if mc_match:
                 # Return the first non-None group
                 return next((g for g in mc_match.groups() if g is not None), "")
 
-        return match
+        return processed_match
 
     return ""
 
