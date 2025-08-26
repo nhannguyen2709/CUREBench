@@ -12,16 +12,55 @@ model:
     max_tokens: 40960
     reasoning:
       effort: "high"
+
+# Search Agent configuration
+search_agent:
+  # Enable/disable search agent (set to true to force use of search agent)
+  enabled: false  # Set to true to use search agent for inference
   
-  # transformers config
-  config:
-    quantization:
-      enabled: true
-      bits: 8
-    device_map: "auto"
-    torch_dtype: "bfloat16"
-    max_tokens: 16384
-    temperature: 0.4
+  # Model config for search agent (can override main model settings)
+  model:
+    model_name: "zai-org/GLM-4.5-FP8"  # Search agent specific model
+    base_url: "http://localhost:8000/v1"  # Reuse from main model config
+    api_key: "EMPTY"  # Reuse from main model config
+    
+  # API endpoints for search functionality
+  api:
+    search_url: "http://127.0.0.1:10000/search"
+    visit_url: "http://127.0.0.1:10000/visit"
+    
+  # Timeout settings (in seconds)
+  timeouts:
+    search: 30
+    visit: 60
+    
+  # Search agent behavior
+  max_turns: 20  # Maximum number of conversation turns
+  per_turn_max_tokens: ${div:${model.sampling.max_tokens},${search_agent.max_turns}}
+  default_num_results: 3  # Default number of search results
+    
+  # System prompt for search agent
+  system_prompt: |
+    You are a helpful assistant. You are answering a question in medical/ healthcare domain. Please perform multi-turn searches, visits and provide comprehensive answers
+
+    When answering questions, you should:
+    1. First THINK about what information you need to gather
+    2. Use search to find relevant information
+    3. Use visit to get detailed content from specific URLs
+    4. Reason through the information systematically
+    5. Provide a comprehensive final answer
+
+    Always use your reasoning capabilities to plan your search strategy and synthesize information effectively. 
+
+    Final note:
+    1. If user provide you the output format that they expect, please strictly follow it.
+    2. Users want you to answer with your knowledge, therefore you don't want to let them know that you cheated by searching the information on internet. Since users are only allowed to see your final answer, never say something like: "Based on my research..." or "Now I have enough information.." in that final response.
+    
+  # Interactive mode commands
+  interactive_commands:
+    exit: "Quit the program"
+    history: "View search history"
+    reset: "Clear conversation history"
 
 # Dataset configuration
 dataset:

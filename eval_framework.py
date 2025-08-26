@@ -76,7 +76,7 @@ class CompetitionKit:
             from models import create_model_instance, inference_function
 
             model_instance = create_model_instance(model_name, base_url, api_key)
-            self.model = CustomModel(model_name, model_instance, partial(inference_function, sampling_params=sampling))
+            self.model = CustomModel(model_name, model_instance, partial(inference_function, sampling_params=sampling), config=self.config)
         else:
             raise ValueError(f"Unknown model type: {model_type}")
 
@@ -214,7 +214,7 @@ class CompetitionKit:
                 accuracy_total_count += local_total
 
                 pbar.update(1)
-                if pbar.n % 50 == 0:
+                if pbar.n % 10 == 0:
                     logger.info(f"Correct: {accuracy_correct_count}, Total: {accuracy_total_count}")
 
         logger.info(f"Parallel evaluation completed. Processed {total_count} examples.")

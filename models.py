@@ -7,6 +7,7 @@ from typing import Any, Callable, Dict, List, Tuple
 
 from openai import OpenAI
 
+from search_agent_glm import SearchAgent
 
 # Set up logging
 logging.basicConfig(
@@ -156,22 +157,45 @@ class CustomModel(BaseModel):
         model_name: str,
         model_instance: Any,
         inference_func: Callable,
+        config: Dict[str, Any] = None,
     ):
         super().__init__(model_name)
         self.model = model_instance
         self._inference_func = inference_func
+        self.config = config or {}
+        
+        self.search_agent = None
+        self.use_search_agent = self.config.get('search_agent', {}).get('enabled', False)
+
+        if self.use_search_agent:
+            self.search_agent = SearchAgent(config=self.config)
+            logger.info(f"Initialized SearchAgent for model: {self.model_name}")
 
     def load(self, **kwargs):
         """Custom models are already loaded"""
-        logger.info(f"Using custom model: {self.model_name}")
+        mode = "SearchAgent" if self.use_search_agent else "Direct"
+        logger.info(f"Using custom model: {self.model_name} (Mode: {mode})")
 
     def inference(self, prompt: str, prompt_type: str) -> Tuple[str, List[Dict]]:
-        """Custom model inference"""
+        """Custom model inference with optional search agent"""
         try:
             # For custom models, we'll create a simple message structure
             messages = [{"role": "user", "content": prompt}]
 
-            response = self._inference_func(self.model, prompt, prompt_type)
+            instructions = "Please reason step-by-step"
+            if "multi_choice" in prompt_type:
+                instructions += ", and put your final answer with only the choice letter within \\boxed{}."
+            else:
+                instructions += ", and put your final answer within \\boxed{}."
+
+            if self.use_search_agent:
+                # Use search agent for inference
+                logger.debug(f"Using SearchAgent for inference: {prompt[:100]}...")
+                response = self.search_agent.search(instructions + "\n\n" + prompt, self.config.search_agent.max_turns)
+            else:
+                # Use regular inference function
+                logger.debug(f"Using direct inference for: {prompt[:100]}...")
+                response = self._inference_func(self.model, prompt, instructions)
 
             # Create complete conversation history
             complete_messages = messages + [{"role": "assistant", "content": response}]
@@ -207,7 +231,7 @@ def create_model_instance(model_name: str, base_url: str = "http://localhost:800
 def inference_function(
     model_instance: Dict[str, Any],
     question: str,
-    question_type: str,
+    instructions: str,
     sampling_params: Dict[str, Any],
 ) -> str:
     """
@@ -225,12 +249,6 @@ def inference_function(
     client: OpenAI = model_instance["client"]
     model_name: str = model_instance["model_name"]
 
-    instructions = "Please reason step-by-step"
-    if "multi_choice" in question_type:
-        instructions += ", and put your final answer with only the choice letter within \\boxed{}."
-    else:
-        instructions += ", and put your final answer within \\boxed{}."
-
     # Call the vLLM endpoint via OpenAI client
     if "gpt-oss" in model_name:
         response = client.responses.create(
@@ -245,6 +263,7 @@ def inference_function(
                 return response_text
         return response.output[-1].content[0].text
     else:
+        # For non-gpt-oss models, use regular OpenAI client
         message = [{"role": "user", "content": instructions + "\n\n" + question}]
         response = client.chat.completions.create(
             model=model_name,
