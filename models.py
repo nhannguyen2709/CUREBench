@@ -167,10 +167,6 @@ class CustomModel(BaseModel):
         self.search_agent = None
         self.use_search_agent = self.config.get('search_agent', {}).get('enabled', False)
 
-        if self.use_search_agent:
-            self.search_agent = SearchAgent(config=self.config)
-            logger.info(f"Initialized SearchAgent for model: {self.model_name}")
-
     def load(self, **kwargs):
         """Custom models are already loaded"""
         mode = "SearchAgent" if self.use_search_agent else "Direct"
@@ -191,14 +187,15 @@ class CustomModel(BaseModel):
             if self.use_search_agent:
                 # Use search agent for inference
                 logger.debug(f"Using SearchAgent for inference: {prompt[:100]}...")
-                response = self.search_agent.search(instructions + "\n\n" + prompt, self.config.search_agent.max_turns)
+                search_agent = SearchAgent(config=self.config)
+                response = search_agent.search(instructions + "\n\n" + prompt, self.config.search_agent.max_turns)
+                complete_messages = search_agent.conversation_history
             else:
                 # Use regular inference function
                 logger.debug(f"Using direct inference for: {prompt[:100]}...")
                 response = self._inference_func(self.model, prompt, instructions)
-
-            # Create complete conversation history
-            complete_messages = messages + [{"role": "assistant", "content": response}]
+                # Create complete conversation history
+                complete_messages = messages + [{"role": "assistant", "content": response}]
 
             return response, complete_messages
         except Exception as e:
@@ -264,6 +261,9 @@ def inference_function(
         return response.output[-1].content[0].text
     else:
         # For non-gpt-oss models, use regular OpenAI client
+        extra_body = {"chat_template_kwargs": {"add_generation_prompt": True, "enable_thinking": True}}
+        if "qwen" in model_name:
+            extra_body.update({"top_k": 20, "min_p": 0.0,})
         message = [{"role": "user", "content": instructions + "\n\n" + question}]
         response = client.chat.completions.create(
             model=model_name,
@@ -271,7 +271,7 @@ def inference_function(
             temperature=sampling_params["temperature"],
             top_p=sampling_params["top_p"],
             max_completion_tokens=sampling_params["max_tokens"],
-            extra_body={"chat_template_kwargs": {"add_generation_prompt": True, "enable_thinking": True}}
+            extra_body=extra_body,
         )
         return response.choices[0].message.content
 

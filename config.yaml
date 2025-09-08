@@ -12,6 +12,8 @@ model:
     max_tokens: 40960
     reasoning:
       effort: "high"
+    
+  enable_thinking: true
 
 # Search Agent configuration
 search_agent:
@@ -20,14 +22,14 @@ search_agent:
   
   # Model config for search agent (can override main model settings)
   model:
-    model_name: "zai-org/GLM-4.5-FP8"  # Search agent specific model
-    base_url: "http://localhost:8000/v1"  # Reuse from main model config
-    api_key: "EMPTY"  # Reuse from main model config
+    model_name: ${model.model_name}  # Search agent specific model
+    base_url: ${model.base_url}  # Reuse from main model config
+    api_key: ${model.api_key}  # Reuse from main model config
     
   # API endpoints for search functionality
   api:
-    search_url: "http://127.0.0.1:10000/search"
-    visit_url: "http://127.0.0.1:10000/visit"
+    search_url: "http://10.100.20.26:10000/search"
+    visit_url: "http://10.100.20.26:10000/visit"
     
   # Timeout settings (in seconds)
   timeouts:
@@ -37,24 +39,22 @@ search_agent:
   # Search agent behavior
   max_turns: 20  # Maximum number of conversation turns
   per_turn_max_tokens: ${div:${model.sampling.max_tokens},${search_agent.max_turns}}
-  default_num_results: 3  # Default number of search results
+  default_num_results: 10  # Default number of search results
     
   # System prompt for search agent
   system_prompt: |
-    You are a helpful assistant. You are answering a question in medical/ healthcare domain. Please perform multi-turn searches, visits and provide comprehensive answers
+    You are a helpful assistant. Your tasks are to perform multi-turn searches, visits and provide comprehensive answers to questions in medical domain.
 
-    When answering questions, you should:
-    1. First THINK about what information you need to gather
-    2. Use search to find relevant information
-    3. Use visit to get detailed content from specific URLs
-    4. Reason through the information systematically
-    5. Provide a comprehensive final answer
+    **Instructions**
+    1. First always think to provide reasoning, arguments, and procedural steps for the functions you will use next.
+    2. Use web_search which requires a search query to get information from a web page. If the information is not relevant to the query, you could search again with another search query.
+    3. Use web_visit to get detailed content from a specific URL.
+    4. Reason through the information systematically.
+    5. Provide a comprehensive final answer.
 
-    Always use your reasoning capabilities to plan your search strategy and synthesize information effectively. 
-
-    Final note:
-    1. If user provide you the output format that they expect, please strictly follow it.
-    2. Users want you to answer with your knowledge, therefore you don't want to let them know that you cheated by searching the information on internet. Since users are only allowed to see your final answer, never say something like: "Based on my research..." or "Now I have enough information.." in that final response.
+    **Answering Tips**
+    1. Please strictly follow the output format expected by the user.
+    2. Never start the final response with "Based on my research" or "Now I have enough information".
     
   # Interactive mode commands
   interactive_commands:
@@ -65,7 +65,7 @@ search_agent:
 # Dataset configuration
 dataset:
   name: "cure_bench_phase_1"
-  path: "data/curebench_valset_phase1.jsonl"
+  path: "data/curebench_valset_nooe.jsonl"
   description: "CureBench 2025 validation questions"
   track: "internal_reasoning"
 

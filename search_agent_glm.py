@@ -103,7 +103,8 @@ def web_search(query: str, config: Optional[Dict[str, Any]] = None) -> str:
     """Perform a web search to local"""
     try:
         query = query.strip()
-        top_k = 5
+        # top_k = config.get("default_num_results", 5)
+        top_k = 10
         preview_char = 256
         
         if not query:
@@ -120,6 +121,8 @@ def web_search(query: str, config: Optional[Dict[str, Any]] = None) -> str:
             search_timeout = search_config.get('timeouts', {}).get('search', search_timeout)
         
         # Call external search API
+        import pdb; pdb.set_trace()
+        client = OpenAI()
         response = requests.post(
             search_api_url,
             json={
@@ -460,7 +463,7 @@ Final note:
         # Create partial functions with config
         from functools import partial
         self.available_functions = {
-            'web_search': partial(web_search, config=self.config),
+            'web_search': partial(web_search, config=self.config.search_agent),
             'web_visit': partial(web_visit, config=self.config)
         }
     
@@ -576,6 +579,9 @@ Final note:
         final_response = ""
         turn = 0
         sampling_config = self.config.model.sampling
+        extra_body = {"chat_template_kwargs": {"enable_thinking": self.config.model.enable_thinking}}
+        if "Qwen3" in self.model_name:
+            extra_body.update({"top_k": 20, "min_p": 0.0,})
         
         while True:
             turn += 1
@@ -586,17 +592,10 @@ Final note:
                 messages=messages,
                 tools=self.functions,
                 tool_choice="auto",
-                temperature=sampling_config.temperature,
                 max_tokens=self.per_turn_max_tokens,
+                temperature=sampling_config.temperature,
                 top_p=sampling_config.top_p,
-                # GLM-4.5-Air specific parameters via extra_body
-                extra_body={
-                    "chat_template_kwargs": {
-                        "enable_thinking": True,  # Enable/disable thinking mode
-                        # "max_thinking_tokens": 8192  # Max tokens for thinking
-                    }
-                },
-    
+                extra_body=extra_body,
                 stream=False,
             )
             if not response:
@@ -690,6 +689,8 @@ Final note:
                     # print("\n[Stopping - detected repeated assistant response]")
                     break
         
+        messages[-1]["search_history"] = self.search_history
+        messages[-1]["usage"] = {"completion_tokens": response.usage.completion_tokens, "prompt_tokens": response.usage.prompt_tokens}
         self.conversation_history = messages
         return final_response
     
