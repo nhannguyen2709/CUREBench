@@ -10,6 +10,8 @@ model:
     temperature: 0.6
     top_p: 0.95
     max_tokens: 40960
+    n_parallel_calls: 8  # Number of parallel calls with different seeds
+    # base_seed: 42  # Base seed for reproducibility
     reasoning:
       effort: "high"
     
@@ -78,7 +80,7 @@ evaluation:
 # Output configuration
 output:
   dir: "results"
-  file: "submission.csv"
+  file: ${model.model_name}.csv
   additional_info: "Unified YAML configuration"
 
 # Hydra configuration

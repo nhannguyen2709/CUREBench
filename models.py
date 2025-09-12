@@ -37,8 +37,13 @@ class BaseModel(ABC):
         pass
 
     @abstractmethod
-    def inference(self, prompt: str, max_tokens: int = 1024) -> Tuple[str, List[Dict]]:
+    async def inference(self, prompt: str, prompt_type: str = None, max_tokens: int = 1024) -> Tuple[str, List[Dict]]:
         """Run inference on the model
+
+        Args:
+            prompt: The input prompt
+            prompt_type: Type of prompt (multi_choice, open_ended, etc.)
+            max_tokens: Maximum number of tokens to generate
 
         Returns:
             Tuple of (response, messages) where messages is the complete conversation history
@@ -72,7 +77,7 @@ class ChatGPTModel(BaseModel):
             api_version=api_version,
         )
 
-    def inference(self, prompt: str, max_tokens: int = 1024) -> Tuple[str, List[Dict]]:
+    async def inference(self, prompt: str, prompt_type: str = None, max_tokens: int = 1024) -> Tuple[str, List[Dict]]:
         """ChatGPT inference"""
         messages = [{"role": "user", "content": prompt}]
 
@@ -115,7 +120,7 @@ class LocalModel(BaseModel):
             logger.error(f"Failed to import local model dependencies: {e}")
             raise
 
-    def inference(self, prompt: str, max_tokens: int = 1024) -> Tuple[str, List[Dict]]:
+    async def inference(self, prompt: str, prompt_type: str = None, max_tokens: int = 1024) -> Tuple[str, List[Dict]]:
         """Local model inference"""
         messages = [
             {"role": "system", "content": "You are a helpful assistant."},
@@ -172,39 +177,17 @@ class CustomModel(BaseModel):
         mode = "SearchAgent" if self.use_search_agent else "Direct"
         logger.info(f"Using custom model: {self.model_name} (Mode: {mode})")
 
-    def inference(self, prompt: str, prompt_type: str) -> Tuple[str, List[Dict]]:
+    async def inference(self, prompt: str, prompt_type: str):
         """Custom model inference with optional search agent"""
-        try:
-            # For custom models, we'll create a simple message structure
-            messages = [{"role": "user", "content": prompt}]
-
-            instructions = "Please reason step-by-step"
-            if "multi_choice" in prompt_type:
-                instructions += ", and put your final answer with only the choice letter within \\boxed{}."
-            else:
-                instructions += ", and put your final answer within \\boxed{}."
-
-            if self.use_search_agent:
-                # Use search agent for inference
-                logger.debug(f"Using SearchAgent for inference: {prompt[:100]}...")
-                search_agent = SearchAgent(config=self.config)
-                response = search_agent.search(instructions + "\n\n" + prompt, self.config.search_agent.max_turns)
-                complete_messages = search_agent.conversation_history
-            else:
-                # Use regular inference function
-                logger.debug(f"Using direct inference for: {prompt[:100]}...")
-                response = self._inference_func(self.model, prompt, instructions)
-                # Create complete conversation history
-                complete_messages = messages + [{"role": "assistant", "content": response}]
-
-            return response, complete_messages
-        except Exception as e:
-            logger.error(f"Custom model inference error: {e}")
-            error_messages = [
-                {"role": "user", "content": prompt},
-                {"role": "assistant", "content": "Error occurred"},
-            ]
-            return "Error occurred", error_messages
+        # # Use search agent for inference
+        # logger.debug(f"Using SearchAgent for inference: {prompt[:100]}...")
+        # search_agent = SearchAgent(config=self.config)
+        # response = search_agent.search(instructions + "\n\n" + prompt, self.config.search_agent.max_turns)
+        # complete_messages = search_agent.conversation_history
+        # Use regular inference function (now async)
+        logger.debug(f"Using direct inference for: {prompt[:100]}...")
+        responses = await self._inference_func(self.model, prompt, "")
+        return responses
 
 
 def create_model_instance(model_name: str, base_url: str = "http://localhost:8000/v1", api_key: str = "EMPTY"):
@@ -225,55 +208,108 @@ def create_model_instance(model_name: str, base_url: str = "http://localhost:800
     return {"client": client, "model_name": model_name, "base_url": base_url}
 
 
-def inference_function(
+def load_instructions(file_path="instruction_variations.txt"):
+    """Load instruction variations from txt file."""
+    with open(file_path, 'r') as f:
+        return [line.strip() for line in f if line.strip()]
+
+
+async def inference_function(
     model_instance: Dict[str, Any],
     question: str,
     instructions: str,
     sampling_params: Dict[str, Any],
 ) -> str:
     """
-    Inference function using vLLM endpoint.
+    Inference function using vLLM endpoint with N parallel calls using different seeds.
     This function will be called for each evaluation example.
 
     Args:
         model_instance: Dictionary containing the client and model info
         question: The question to answer
-        kwargs: Additional keyword arguments
+        instructions: Instructions for the model
+        sampling_params: Sampling parameters including temperature, top_p, etc.
 
     Returns:
-        The response from the model
+        The best response from N parallel calls
     """
+    import asyncio
+    import random
+    import concurrent.futures
+    
     client: OpenAI = model_instance["client"]
     model_name: str = model_instance["model_name"]
+    
+    # Get number of parallel calls from sampling params, default to 8
+    n_calls = sampling_params.get("n_parallel_calls", 8)
+    
+    # Generate different seeds for each call
+    base_seed = sampling_params.get("base_seed", random.randint(0, 2**31 - 1))
+    seeds = [base_seed + i * 1000 for i in range(n_calls)]
+    instructions = random.sample(load_instructions(), n_calls)
+    
+    def single_inference_call(seed: int, instruction: str) -> str:
+        """Make a single inference call with a specific seed"""
+        if "gpt-oss" in model_name:
+            response = client.responses.create(
+                model=model_name, 
+                input=question, 
+                instructions=instructions, 
+                max_output_tokens=sampling_params["max_tokens"], 
+                reasoning=sampling_params.get("reasoning", {}),
+                temperature=sampling_params["temperature"], 
+                top_p=sampling_params["top_p"],
+                seed=seed
+            )
+            
+            # Extract the response content
+            for output in response.output:
+                if output.type == "reasoning":
+                    return output.content[0].text
+            return response.output[-1].content[0].text
+        else:
+            # For non-gpt-oss models, use regular OpenAI client
+            extra_body = {
+                "chat_template_kwargs": {"add_generation_prompt": True, "enable_thinking": True},
+                "seed": seed
+            }
+            if "qwen" in model_name:
+                extra_body.update({"top_k": 20, "min_p": 0.0})
 
-    # Call the vLLM endpoint via OpenAI client
-    if "gpt-oss" in model_name:
-        response = client.responses.create(
-            model=model_name, input=question, instructions=instructions, 
-            max_output_tokens=sampling_params["max_tokens"], reasoning=sampling_params["reasoning"],
-            temperature=sampling_params["temperature"], top_p=sampling_params["top_p"])
+            message = [{"role": "user", "content": instruction + "\n\n" + question}]
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=message,
+                n=1,  # Single response per call since we're making N parallel calls
+                temperature=sampling_params["temperature"],
+                top_p=sampling_params["top_p"],
+                max_completion_tokens=sampling_params["max_tokens"],
+                extra_body=extra_body,
+            )
+            return response.choices[0].message.content
 
-        # Extract the response content
-        for output in response.output:
-            if output.type == "reasoning":
-                response_text = output.content[0].text
-                return response_text
-        return response.output[-1].content[0].text
-    else:
-        # For non-gpt-oss models, use regular OpenAI client
-        extra_body = {"chat_template_kwargs": {"add_generation_prompt": True, "enable_thinking": True}}
-        if "qwen" in model_name:
-            extra_body.update({"top_k": 20, "min_p": 0.0,})
-        message = [{"role": "user", "content": instructions + "\n\n" + question}]
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=message,
-            temperature=sampling_params["temperature"],
-            top_p=sampling_params["top_p"],
-            max_completion_tokens=sampling_params["max_tokens"],
-            extra_body=extra_body,
-        )
-        return response.choices[0].message.content
+    # Make N parallel calls with different seeds using ThreadPoolExecutor
+    loop = asyncio.get_event_loop()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_calls) as executor:
+        # Create partial functions with different seeds
+        tasks = [
+            loop.run_in_executor(executor, single_inference_call, seed, instruction) 
+            for seed, instruction in zip(seeds, instructions)
+        ]
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Filter out any exceptions and get valid responses
+    valid_responses = []
+    for i, response in enumerate(responses):
+        if isinstance(response, Exception):
+            logger.warning(f"Inference call {i} with seed {seeds[i]} failed: {response}")
+        else:
+            valid_responses.append(response)
+    
+    if not valid_responses:
+        raise RuntimeError("All parallel inference calls failed")
+    
+    return valid_responses
 
 
 def extract_boxed_text(text, extract_mc_letter=True):

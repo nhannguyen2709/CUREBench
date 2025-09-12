@@ -1,4 +1,6 @@
 import asyncio
+import random
+from collections import Counter
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -19,13 +21,53 @@ class EvaluationResult:
     details: Optional[Dict] = None
 
 
-def get_prediction_with_trace(model: BaseModel, example: Dict) -> Tuple[Dict, str]:
+def majority_vote_with_random_selection(responses: List[str]) -> Tuple[str, str]:
+    """
+    Perform majority voting on responses and randomly select one response with the winning choice.
+    
+    Args:
+        responses: List of response strings from N sampling
+        
+    Returns:
+        Tuple of (final_choice, selected_response)
+    """
+    if not responses:
+        return "", ""
+    
+    # Extract choices from all responses
+    choices = [extract_solution(response) for response in responses]
+    
+    # Filter out empty/None choices and count frequencies
+    valid_choices = [choice for choice in choices if choice and str(choice).strip()]
+    
+    if not valid_choices:
+        # If no valid choices, return first response
+        return "", responses[0]
+    
+    # Find most frequent choice (majority vote)
+    choice_counts = Counter(valid_choices)
+    most_common_choice = choice_counts.most_common(1)[0][0]
+    
+    # Find all responses that have the winning choice
+    matching_responses = []
+    for i, choice in enumerate(choices):
+        if choice == most_common_choice:
+            matching_responses.append(responses[i])
+    
+    # Randomly select one response from those with the winning choice
+    selected_response = random.choice(matching_responses) if matching_responses else responses[0]
+    
+    return most_common_choice, selected_response
+
+
+async def get_prediction_with_trace(model: BaseModel, example: Dict) -> Tuple[Dict, str]:
     """Get model prediction and reasoning trace for a single example"""
     question = example["question"]
     question_type = example["question_type"]
 
     # Get model response and messages using the model's inference method
-    response, reasoning_trace = model.inference(question, prompt_type=question_type)
+    responses = await model.inference(question, prompt_type=question_type)
+    responses = [r for r in responses if r is not None]
 
     # Initialize prediction dictionary
     prediction = {
@@ -33,32 +75,31 @@ def get_prediction_with_trace(model: BaseModel, example: Dict) -> Tuple[Dict, st
         "open_ended_answer": "",  # Use empty string instead of None
     }
 
+    # Use majority voting for multiple choice questions
+    final_choice, selected_response = majority_vote_with_random_selection(responses)
+
     # Extract answer from response
     if (
         question_type == "multi_choice"
         or question_type == "open_ended_multi_choice"
     ):
-        # For multiple choice, extract the letter
-        # choice = self._extract_multiple_choice_answer(response)
-        choice = extract_solution(response)
         # Ensure choice is never None or NULL
         prediction["choice"] = (
-            choice if choice and str(choice).upper() not in ["NONE", "NULL"] else ""
+            final_choice if final_choice and str(final_choice).upper() not in ["NONE", "NULL"] else ""
         )
-        prediction["open_ended_answer"] = response.strip()  # Keep full response too
+        prediction["open_ended_answer"] = selected_response.strip()  # Keep selected response
     elif question_type == "open_ended":
-        # For open-ended, only return response, use N/A for choice to avoid empty string issues
         prediction["choice"] = (
-            "NOTAVALUE"  # Use N/A instead of empty string to avoid NULL validation issues
+            "NOTAVALUE"  # Use NOTAVALUE instead of empty string to avoid NULL validation issues
         )
-        prediction["open_ended_answer"] = response.strip()
+        prediction["open_ended_answer"] = selected_response.strip()
 
-    return prediction, reasoning_trace
+    return prediction, selected_response
 
 
 async def process_example(i: int, model: BaseModel, example: Dict):
     """Process a single example asynchronously"""
-    prediction, reasoning_trace = await asyncio.to_thread(get_prediction_with_trace, model, example)
+    prediction, reasoning_trace = await get_prediction_with_trace(model, example)
 
     question_type = example["question_type"]
     expected_answer = example.get("answer")
