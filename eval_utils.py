@@ -35,7 +35,12 @@ def majority_vote_with_random_selection(responses: List[str]) -> Tuple[str, str]
         return "", ""
     
     # Extract choices from all responses
-    choices = [extract_solution(response) for response in responses]
+    choices = []
+    for response in responses:
+        try:
+            choices.append(extract_solution(response))
+        except:
+            choices.append("")
     
     # Filter out empty/None choices and count frequencies
     valid_choices = [choice for choice in choices if choice and str(choice).strip()]
